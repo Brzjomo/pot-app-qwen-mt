@@ -1,17 +1,9 @@
 async function translate(text, from, to, options) {
     const { config, utils } = options;
     const { tauriFetch: fetch } = utils;
-    let { model = "qwen-mt-flash", apiKey, requestPath } = config;
+    let { model = "qwen-mt-flash", apiKey, domains, temperature } = config;
 
-    if (!requestPath) {
-        requestPath = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions";
-    }
-    if (!/https?:\/\/.+/.test(requestPath)) {
-        requestPath = `https://${requestPath}`;
-    }
-    if (requestPath.endsWith('/')) {
-        requestPath = requestPath.slice(0, -1);
-    }
+    const requestPath = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions";
 
     const headers = {
         'Content-Type': 'application/json',
@@ -33,6 +25,25 @@ async function translate(text, from, to, options) {
             "source_lang": from,
             "target_lang": to
         }
+    }
+
+    if (domains) {
+        extraBody.translation_options.domains = domains;
+    }
+
+    if (temperature !== undefined && temperature !== null && temperature !== '') {
+        try {
+            const tempValue = parseFloat(temperature);
+            if (!isNaN(tempValue) && tempValue >= 0 && tempValue < 2) {
+                extraBody.translation_options.temperature = tempValue;
+            } else {
+                extraBody.translation_options.temperature = 0.65;
+            }
+        } catch (e) {
+            extraBody.translation_options.temperature = 0.65;
+        }
+    } else {
+        extraBody.translation_options.temperature = 0.65;
     }
 
     const res = await fetch(requestPath, {

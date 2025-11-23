@@ -15,15 +15,23 @@
         "qwen-mt-plus": "qwen-mt-plus"
       }
     },
-    {
-      "key": "requestPath",
-      "display": "请求路径",
-      "type": "input"
-    },
+    
     {
       "key": "apiKey",
       "display": "API Key",
       "type": "input"
+    },
+    {
+      "key": "domains",
+      "display": "领域提示 (必须为英语)",
+      "type": "input",
+      "placeholder": "可选：用于指定翻译领域风格。（必须为英语）"
+    },
+    {
+      "key": "temperature",
+      "display": "Temperature [0, 2)",
+      "type": "input",
+      "placeholder": "可选：默认值 0.65。取值范围：[0, 2)"
     }
   ],
   "language": {
