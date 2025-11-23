@@ -1,4 +1,4 @@
-### Qwen OCR插件
+### Qwen MT翻译插件
 
 翻译软件[pot-app](https://github.com/pot-app/pot-desktop)用于支持千问mt系列翻译模型的插件。
 
