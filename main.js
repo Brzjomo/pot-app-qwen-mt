@@ -1,4 +1,5 @@
 async function translate(text, from, to, options) {
+    // 1. 获取配置和工具
     const { config, utils } = options;
     const { 
         tauriFetch: fetch, 
@@ -6,32 +7,54 @@ async function translate(text, from, to, options) {
         readTextFile, 
         writeTextFile, 
         exists,
-        createDir,
         cacheDir, 
         join,
         info, warn, error
     } = utils;
 
-    let { model = "qwen-mt-flash", apiKey, domains, temperature, termsFile, databaseFile, forceOnline } = config;
+    // 2. 读取用户配置
+    let { 
+        model = "qwen-mt-flash", 
+        apiKey, 
+        domains, 
+        temperature, 
+        termsFile, 
+        databaseFile, 
+        forceOnline 
+    } = config;
 
-    // --- 辅助函数：处理路径 ---
-    const resolvePath = async (base, filePath) => {
-        if (!filePath) return null;
-        // 警告：如果用户填了绝对路径（如 C:/...），必须在 tauri.conf.json 的允许范围内，否则会报错
-        if (filePath.includes('/') || filePath.includes('\\')) return filePath; 
-        if (join) return await join(base, filePath);
-        return `${base}/${filePath}`;
+    // --- 辅助函数：智能路径解析 ---
+    // 作用：将用户输入的文件名自动转换为 AppCache 目录下的绝对路径
+    const resolvePath = async (fileName) => {
+        if (!fileName) return null;
+        
+        // 如果包含斜杠，说明用户填了路径（可能是绝对路径），给予警告
+        if (fileName.includes('/') || fileName.includes('\\')) {
+            await warn(`[Config] 检测到路径配置: "${fileName}"。请确保该路径在 tauri.conf.json 的 fs scope 允许范围内，否则建议仅填写文件名（将自动存入缓存目录）。`);
+            return fileName; 
+        }
+        
+        // 自动拼接缓存目录 (推荐)
+        if (join) {
+            return await join(cacheDir, fileName);
+        }
+        return `${cacheDir}/${fileName}`;
     };
 
     const forceOnlineBool = forceOnline === 'true';
 
-    // ================= 数据库逻辑 =================
+    // ================= 3. 数据库缓存逻辑 (SQLite) =================
     let cachedTranslation = null;
     let db = null; 
+    
     if (databaseFile && databaseFile.trim() !== '') {
         try {
-            const fullDbPath = await resolvePath(cacheDir, databaseFile);
+            const fullDbPath = await resolvePath(databaseFile);
+            
+            // 连接数据库
             db = await Database.load(`sqlite:${fullDbPath}`);
+            
+            // 初始化表结构
             await db.execute(`
                 CREATE TABLE IF NOT EXISTS translations (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -45,6 +68,7 @@ async function translate(text, from, to, options) {
             `);
 
             if (!forceOnlineBool) {
+                // 查询缓存
                 const result = await db.select(`
                     SELECT translated_text FROM translations
                     WHERE source_text = ? AND source_lang = ? AND target_lang = ?
@@ -52,68 +76,79 @@ async function translate(text, from, to, options) {
 
                 if (result && result.length > 0) {
                     cachedTranslation = result[0].translated_text;
-                    await info(`[翻译来源] DATABASE (缓存命中)`);
-                    return cachedTranslation;
+                    await info(`[翻译来源] DATABASE (Cache Hit)`);
+                    return cachedTranslation; // <--- 命中缓存，直接返回
                 } else {
-                    await info(`[翻译来源] 缓存未命中`);
+                    await info(`[翻译来源] Cache Miss`);
                 }
             } else {
-                await info(`[翻译来源] 强制在线翻译，跳过缓存`);
+                await info(`[翻译来源] Forced Online (Skip Cache)`);
             }
         } catch (err) {
-            await warn(`数据库初始化或查询失败: ${err}`);
+            await warn(`[Database Error] 初始化或查询失败: ${err}`);
+            // 数据库出错不应阻断翻译，继续执行后续在线逻辑
         }
     }
 
-    // ================= 术语表逻辑 (核心修复) =================
+    // ================= 4. 术语表加载逻辑 (JSON) =================
     let terms = [];
     if (termsFile && termsFile.trim() !== '') {
         try {
-            const fullTermsPath = await resolvePath(cacheDir, termsFile);
+            const fullTermsPath = await resolvePath(termsFile);
             
-            // 1. 主动检查文件是否存在
-            const isExists = await exists(fullTermsPath).catch(e => {
-                warn(`检查文件存在性失败 (可能是权限问题): ${e}`);
-                return false; 
-            });
+            // 4.1 主动检查文件是否存在
+            let isExists = false;
+            try {
+                isExists = await exists(fullTermsPath);
+            } catch (e) {
+                // 如果路径非法或无权限，exists 可能会抛错
+                await warn(`[Terms] 检查文件失败: ${e}`);
+            }
 
+            // 4.2 如果不存在，自动创建空文件
             if (!isExists) {
-                await info(`术语表不存在: ${fullTermsPath}，尝试创建...`);
+                await info(`[Terms] 文件不存在，尝试创建: ${fullTermsPath}`);
                 try {
-                    // 尝试写入空数组
+                    // 确保父目录存在（如果是纯文件名，join 后父目录就是 cacheDir，通常已存在）
+                    // 写入空数组 []
                     await writeTextFile(fullTermsPath, "[]");
-                    await info(`已成功创建术语表文件`);
+                    await info(`[Terms] 已成功创建空术语表`);
+                    isExists = true; 
                 } catch (createErr) {
-                    await error(`创建术语表失败: ${createErr}。请检查路径是否在允许的范围内 ($APPCACHE)`);
+                    await error(`[Terms] 创建失败: ${createErr}。请检查路径权限或 tauri.conf.json 配置。`);
                 }
             }
 
-            // 2. 读取文件
-            if (await exists(fullTermsPath)) {
+            // 4.3 读取并解析
+            if (isExists) {
                 const termsContent = await readTextFile(fullTermsPath);
                 try {
                     const parsedTerms = JSON.parse(termsContent);
                     if (Array.isArray(parsedTerms)) {
                         terms = parsedTerms;
-                        await info(`加载了 ${terms.length} 条术语`);
+                        await info(`[Terms] 已加载 ${terms.length} 条术语`);
                     } else {
-                        await warn(`术语表格式错误: 必须是 JSON 数组`);
+                        await warn(`[Terms] 格式错误: 内容必须是 JSON 数组，例如 [{"source":"Src","target":"Tgt"}]`);
                     }
                 } catch (jsonErr) {
-                    await warn(`术语表 JSON 解析失败: ${jsonErr}`);
+                    await warn(`[Terms] JSON 解析失败: ${jsonErr}`);
                 }
             }
         } catch (err) {
-            await warn(`术语表处理流程异常: ${err}`);
+            await warn(`[Terms] 处理流程异常: ${err}`);
         }
     }
 
-    // ================= 在线翻译请求 =================
+    // ================= 5. 在线翻译请求 (Qwen API) =================
     const requestPath = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions";
+    
+    // 构建请求体
     const body = {
         model,
         messages: [{ "role": "user", "content": text }]
     };
+
+    // 构建翻译专用参数
     const extraBody = {
         "translation_options": {
             "source_lang": from,
@@ -121,9 +156,12 @@ async function translate(text, from, to, options) {
             "temperature": parseFloat(temperature) || 0.65
         }
     };
+    
+    // 注入术语表和领域
     if (terms.length > 0) extraBody.translation_options.terms = terms;
     if (domains) extraBody.translation_options.domains = domains;
 
+    // 发起 HTTP 请求
     const res = await fetch(requestPath, {
         method: 'POST',
         headers: {
@@ -136,25 +174,34 @@ async function translate(text, from, to, options) {
         }
     });
 
+    // ================= 6. 处理响应与写入缓存 =================
     if (res.ok) {
-        let translation = res.data?.choices?.[0]?.message?.content || "";
+        let result = res.data;
+        let translation = result?.choices?.[0]?.message?.content || "";
+        
+        // 清理可能的特殊标记
         translation = translation.replace(/<\|endofcontent\|>/g, '').trim();
+        
         await info(`[翻译来源] ONLINE API`);
 
-        // 写入缓存
+        // 写入数据库缓存
         if (db && translation) {
             try {
                 await db.execute(`
                     INSERT OR REPLACE INTO translations (source_text, source_lang, target_lang, translated_text)
                     VALUES (?, ?, ?, ?)
                 `, [text, from, to, translation]);
-                await info(`[Cache] 已缓存翻译结果`);
+                await info(`[Cache] 新翻译已存入数据库`);
             } catch (e) {
                 await warn(`[Cache] 写入失败: ${e}`);
             }
         }
+
         return translation;
     } else {
-        throw `API Error ${res.status}: ${JSON.stringify(res.data)}`;
+        // 抛出错误以便 Pot Desktop 前端捕获显示
+        const errMsg = `API Error ${res.status}: ${JSON.stringify(res.data)}`;
+        await error(errMsg);
+        throw errMsg;
     }
 }
