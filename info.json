@@ -32,6 +32,28 @@
       "display": "Temperature [0, 2)",
       "type": "input",
       "placeholder": "可选：默认值 0.65。取值范围：[0, 2)"
+    },
+    {
+      "key": "termsFile",
+      "display": "术语表JSON文件路径",
+      "type": "input",
+      "placeholder": "自定义术语表JSON文件路径，如不存在将自动创建"
+    },
+    {
+      "key": "databaseFile",
+      "display": "翻译数据库SQLite文件路径",
+      "type": "input",
+      "placeholder": "SQLite数据库文件路径，用于缓存翻译结果，如不存在将自动创建"
+    },
+    {
+      "key": "forceOnline",
+      "display": "强制在线翻译",
+      "type": "select",
+      "options": {
+        "false": "禁用",
+        "true": "启用"
+      },
+      "placeholder": "启用时跳过数据库缓存，直接请求在线翻译"
     }
   ],
   "language": {

@@ -1,3 +1,6 @@
 *.zip
 *.potext
 *.txt
+项目文档/
+*.json
+*.sqlite
