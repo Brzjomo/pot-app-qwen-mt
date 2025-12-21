@@ -35,9 +35,9 @@
     },
     {
       "key": "termsFile",
-      "display": "术语表JSON文件名（在缓存目录）",
+      "display": "术语表SQLite数据库文件名（在缓存目录）",
       "type": "input",
-      "placeholder": "自定义术语表JSON文件名，如不存在将自动创建"
+      "placeholder": "SQLite数据库文件名，如不存在将自动创建（支持JSON格式自动迁移）"
     },
     {
       "key": "databaseFile",

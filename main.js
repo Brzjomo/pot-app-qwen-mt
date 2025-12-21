@@ -90,52 +90,95 @@ async function translate(text, from, to, options) {
         }
     }
 
-    // ================= 4. 术语表加载逻辑 (JSON) =================
+    // ================= 4. 术语表加载逻辑 (SQLite) =================
     let terms = [];
+    let termsDb = null;
+
     if (termsFile && termsFile.trim() !== '') {
         try {
             const fullTermsPath = await resolvePath(termsFile);
-            
-            // 4.1 主动检查文件是否存在
-            let isExists = false;
+
+            // 4.1 检查文件是否存在
+            let fileExists = false;
             try {
-                isExists = await exists(fullTermsPath);
+                fileExists = await exists(fullTermsPath);
             } catch (e) {
-                // 如果路径非法或无权限，exists 可能会抛错
                 await warn(`[Terms] 检查文件失败: ${e}`);
             }
 
-            // 4.2 如果不存在，自动创建空文件
-            if (!isExists) {
-                await info(`[Terms] 文件不存在，尝试创建: ${fullTermsPath}`);
+            // 4.2 检测文件格式并初始化数据库
+            let needMigration = false;
+            let jsonTerms = [];
+
+            if (fileExists) {
+                // 尝试读取文件内容检测是否为JSON格式
                 try {
-                    // 确保父目录存在（如果是纯文件名，join 后父目录就是 cacheDir，通常已存在）
-                    // 写入空数组 []
-                    await writeTextFile(fullTermsPath, "[]");
-                    await info(`[Terms] 已成功创建空术语表`);
-                    isExists = true; 
-                } catch (createErr) {
-                    await error(`[Terms] 创建失败: ${createErr}。请检查路径权限或 tauri.conf.json 配置。`);
+                    const fileContent = await readTextFile(fullTermsPath);
+                    const parsed = JSON.parse(fileContent);
+                    if (Array.isArray(parsed)) {
+                        // 文件是JSON格式，保存术语数据用于迁移
+                        jsonTerms = parsed;
+                        needMigration = true;
+                        await info(`[Terms] 检测到JSON格式术语表，包含 ${jsonTerms.length} 条术语`);
+                    }
+                } catch (jsonErr) {
+                    // 不是JSON格式，可能是SQLite数据库或损坏的文件
+                    // 继续尝试作为SQLite数据库打开
                 }
             }
 
-            // 4.3 读取并解析
-            if (isExists) {
-                const termsContent = await readTextFile(fullTermsPath);
-                try {
-                    const parsedTerms = JSON.parse(termsContent);
-                    if (Array.isArray(parsedTerms)) {
-                        terms = parsedTerms;
-                        await info(`[Terms] 已加载 ${terms.length} 条术语`);
-                    } else {
-                        await warn(`[Terms] 格式错误: 内容必须是 JSON 数组，例如 [{"source":"Src","target":"Tgt"}]`);
-                    }
-                } catch (jsonErr) {
-                    await warn(`[Terms] JSON 解析失败: ${jsonErr}`);
-                }
+            // 4.3 连接术语表数据库
+            // 如果文件是JSON格式，Database.load可能会失败，但我们仍然尝试
+            try {
+                termsDb = await Database.load(`sqlite:${fullTermsPath}`);
+            } catch (dbErr) {
+                // 数据库连接失败，可能是文件格式不正确
+                await warn(`[Terms] SQLite数据库连接失败: ${dbErr}`);
+                termsDb = null;
             }
+
+            // 4.4 如果数据库连接成功，初始化表结构
+            if (termsDb) {
+                await termsDb.execute(`
+                    CREATE TABLE IF NOT EXISTS terms (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        source TEXT NOT NULL,
+                        target TEXT NOT NULL,
+                        case_sensitive BOOLEAN DEFAULT 0,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE(source)
+                    )
+                `);
+
+                // 4.5 如果需要迁移JSON数据
+                if (needMigration && jsonTerms.length > 0) {
+                    await info(`[Terms] 开始迁移JSON术语到SQLite数据库...`);
+                    let migratedCount = 0;
+                    for (const term of jsonTerms) {
+                        if (term.source && term.target) {
+                            try {
+                                await termsDb.execute(
+                                    `INSERT OR IGNORE INTO terms (source, target) VALUES (?, ?)`,
+                                    [term.source, term.target]
+                                );
+                                migratedCount++;
+                            } catch (insertErr) {
+                                // 忽略重复项错误
+                            }
+                        }
+                    }
+                    await info(`[Terms] 已迁移 ${migratedCount} 条术语到SQLite数据库`);
+                }
+
+                await info(`[Terms] SQLite术语表数据库已就绪`);
+            } else if (needMigration) {
+                // 数据库连接失败但有JSON数据，无法迁移
+                await warn(`[Terms] 无法创建SQLite数据库，术语表功能将不可用`);
+            }
+
         } catch (err) {
-            await warn(`[Terms] 处理流程异常: ${err}`);
+            await warn(`[Terms] 术语表初始化失败: ${err}`);
+            termsDb = null;
         }
     }
 
@@ -148,6 +191,56 @@ async function translate(text, from, to, options) {
         messages: [{ "role": "user", "content": text }]
     };
 
+    // 术语匹配逻辑：从数据库中查找匹配的术语
+    let matchedTerms = [];
+    if (termsDb) {
+        try {
+            // 从数据库加载所有术语
+            const allTerms = await termsDb.select(`SELECT source, target, case_sensitive FROM terms`);
+            await info(`[Terms] 从数据库加载了 ${allTerms.length} 条术语`);
+
+            // 在文本中查找匹配的术语（支持单词边界和大小写敏感度）
+            for (const term of allTerms) {
+                const source = term.source;
+                const caseSensitive = term.case_sensitive === 1;
+
+                let isMatch = false;
+
+                // 构建正则表达式进行单词边界匹配
+                // 转义正则表达式特殊字符
+                const escapedSource = source.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                const regexPattern = `\\b${escapedSource}\\b`;
+                const regexFlags = caseSensitive ? '' : 'i';
+
+                try {
+                    const regex = new RegExp(regexPattern, regexFlags);
+                    isMatch = regex.test(text);
+                } catch (regexErr) {
+                    // 如果正则表达式构建失败，回退到简单包含匹配
+                    if (caseSensitive) {
+                        isMatch = text.includes(source);
+                    } else {
+                        isMatch = text.toLowerCase().includes(source.toLowerCase());
+                    }
+                }
+
+                if (isMatch) {
+                    matchedTerms.push({
+                        source: term.source,
+                        target: term.target
+                    });
+                }
+            }
+
+            await info(`[Terms] 找到 ${matchedTerms.length} 条匹配术语`);
+        } catch (err) {
+            await warn(`[Terms] 术语匹配失败: ${err}`);
+        }
+    }
+
+    // 如果没有术语数据库或匹配失败，回退到空数组
+    terms = matchedTerms;
+
     // 构建翻译专用参数
     const extraBody = {
         "translation_options": {
@@ -156,7 +249,7 @@ async function translate(text, from, to, options) {
             "temperature": parseFloat(temperature) || 0.65
         }
     };
-    
+
     // 注入术语表和领域
     if (terms.length > 0) extraBody.translation_options.terms = terms;
     if (domains) extraBody.translation_options.domains = domains;
